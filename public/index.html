@@ -121,6 +121,32 @@
     </div>
   </section>
 
+  <section class="local-wrap">
+    <h2>局部套色偏移</h2>
+    <div class="local-controls">
+      <span id="localStats" class="local-stats"></span>
+      <span class="spacer"></span>
+      <button id="btnExportLocal" type="button" disabled title="下载各块最佳位移、位移前后均差与采样信息的 JSON">导出局部偏移 JSON</button>
+      <span id="localHint" class="export-hint"></span>
+    </div>
+    <div class="local-body">
+      <figure class="local-view">
+        <figcaption>分块诊断视图 <span class="hint">参考图 4×4 分块 · 箭头＝校准像素相对参考像素的最佳位移方向（屏幕坐标，y 向下）· 橙＝检出局部偏移、灰点＝无偏移、压暗＝不可判定；坐标均为参考图像素</span></figcaption>
+        <canvas id="localCanvas"></canvas>
+      </figure>
+      <div class="local-side">
+        <table id="localTable">
+          <thead>
+            <tr>
+              <th>#</th><th>参考图坐标范围</th><th title="8 方向箭头：校准像素相对参考像素的位移方向">方向</th><th>dx, dy (px)</th><th>位移长度 (px)</th><th title="位移前 (0,0) 的 RGB 平均绝对差">位移前均差</th><th title="最佳位移后的 RGB 平均绝对差">位移后均差</th><th title="最佳候选可比较点数 / 该块采样点数（合格候选数）">可比较点</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
   <footer>
     <p>仿射最小二乘拟合在浏览器本地完成；图像不会上传服务器。POST /api/fit 提供同样的拟合接口供程序化调用。</p>
   </footer>

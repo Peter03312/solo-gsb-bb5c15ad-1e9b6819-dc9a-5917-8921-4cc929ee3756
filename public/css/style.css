@@ -276,4 +276,44 @@ td.note-cell {
   text-overflow: ellipsis;
 }
 
+/* 局部套色偏移分块诊断 */
+.local-wrap { margin-top: 24px; }
+.local-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+.local-stats { color: var(--muted); font-size: 13px; }
+.local-body {
+  display: grid;
+  grid-template-columns: 1fr 430px;
+  gap: 16px;
+  align-items: start;
+}
+@media (max-width: 1100px) { .local-body { grid-template-columns: 1fr; } }
+.local-view { margin: 0; }
+.local-view figcaption {
+  font-size: 14px;
+  margin-bottom: 6px;
+  color: var(--text);
+}
+.local-view figcaption .hint { color: var(--muted); font-size: 12px; margin-left: 6px; }
+.local-view canvas { cursor: default; }
+.local-side {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  max-height: 560px;
+  overflow: auto;
+}
+.local-side table { font-size: 12px; }
+.local-side td, .local-side th { padding: 4px 6px; }
+.local-side .local-arrow { font-size: 14px; font-weight: 700; text-align: center; }
+.local-side tbody tr.local-shift-row td { color: #fcd34d; }
+.local-side tbody tr.local-na-row td { color: var(--muted); }
+
 footer { margin-top: 28px; color: var(--muted); font-size: 12px; }

@@ -9,8 +9,10 @@
  * transformRGBA 像素变换。「差异区域」视图端到端验证：满足条件时复用重采样
  * 结果逐像素比较、八邻域分组并按面积展示边框/像素数/坐标范围；色差阈值与
  * 最小面积调节（含非法输入）后更新或清空；拟合无效（共线）、点位变化、
- * 非法容差等条件失效时清空旧标记并说明原因。同时校验 app.js 引用的所有
- * DOM id 都存在于 index.html。
+ * 非法容差等条件失效时清空旧标记并说明原因。「局部套色偏移」诊断端到端验证：
+ * 复用同一份校准重采样像素做 4×4 分块、±4 px 整数位移搜索、alpha≥128 与 20%
+ * 可比较点门槛、dx/dy 与位移前后均差展示、JSON 导出，条件失效时清空旧诊断。
+ * 同时校验 app.js 引用的所有 DOM id 都存在于 index.html。
  */
 'use strict';
 
@@ -179,6 +181,10 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(els.diffHint.textContent.includes('图像缺失'), '差异视图应说明图像缺失: ' + els.diffHint.textContent);
   assert.strictEqual(els.diffTable.querySelector('tbody').innerHTML, '');
   assert.strictEqual(els.btnExportReview.disabled, true, '无差异结果前导出复核按钮应禁用');
+  // 局部套色偏移诊断：初始缺图同样清空并说明原因，表格为空、导出禁用
+  assert.ok(els.localHint.textContent.includes('图像缺失'), '局部诊断应说明图像缺失: ' + els.localHint.textContent);
+  assert.strictEqual(els.localTable.querySelector('tbody').innerHTML, '');
+  assert.strictEqual(els.btnExportLocal.disabled, true, '无局部诊断结果前导出按钮应禁用');
   console.log('✓ 初始渲染正常，DOM id 与 index.html 一致（导出校准扫描图禁用并说明原因）');
 
   // 1. 载入示例图像
@@ -382,6 +388,108 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(diffTbody().innerHTML.includes('未复核'), '被最小面积过滤后恢复的区域应重新复核: ' + diffTbody().innerHTML);
   console.log('✓ 复核继承：最小面积过滤致区域消失后恢复，结论不继承');
 
+  // 2.12 局部套色偏移诊断：复用校准重采样像素，4×4 分块、±4 px 位移搜索、20% 门槛
+  const localTbodyEl = els.localTable.querySelector('tbody');
+  const localRows = () => (localTbodyEl.innerHTML.match(/<tr[\s>]/g) || []).length;
+  await flushDebounce(); // 等局部诊断去抖（与差异视图独立计时）
+  assert.strictEqual(els.localHint.textContent, '', '条件满足时局部诊断不应有禁用提示: ' + els.localHint.textContent);
+  assert.ok(els.localStats.textContent.includes('4×4 分块'), '统计应说明 4×4 分块: ' + els.localStats.textContent);
+  assert.ok(els.localStats.textContent.includes('共 16 块'));
+  assert.ok(els.localStats.textContent.includes('±4 px'));
+  assert.ok(els.localStats.textContent.includes('1024'));
+  assert.ok(els.localStats.textContent.includes('alpha ≥ 128'));
+  assert.ok(els.localStats.textContent.includes('20%'));
+  assert.strictEqual(localRows(), 16, '表格应列出 16 个块');
+  assert.strictEqual(els.btnExportLocal.disabled, false, '有诊断结果后导出按钮应启用');
+  const allLocalRows = () => localTbodyEl.innerHTML.match(/<tr[\s\S]*?<\/tr>/g);
+  // 样例：纯白块的全部候选均差相同 → 平局取最短位移 (0,0)；含黑块的块 #1 因亚像素
+  // 残差检出仍有局部位移（dy=+2，位移后均差下降），其余 15 块为 (0,0)，全部可判定
+  assert.ok(!localTbodyEl.innerHTML.includes('不可判定'), '不透明样例所有块都应可判定');
+  const zeroRows = allLocalRows().filter((row) => />0, 0</.test(row));
+  assert.strictEqual(zeroRows.length, 15, '15 个纯白块最佳位移为 0,0');
+  const shiftedRows = allLocalRows().filter((row) => !/>0, 0</.test(row));
+  assert.strictEqual(shiftedRows.length, 1, '仅含黑块的块 #1 检出局部偏移');
+  assert.strictEqual(shiftedRows[0], allLocalRows()[0], '检出块应为行优先的块 #1');
+  assert.ok(shiftedRows[0].includes('0, 2'), '块 #1 检出 dy=+2: ' + shiftedRows[0]);
+  assert.ok(shiftedRows[0].includes('↓'), 'dy=+2 应为向下箭头');
+  // 含黑块的块（行 0 列 0，x0..239 y0..159，黑块在 x40..49 y50..59）位移后均差下降
+  // 表格行顺序与块 index 一致（行优先），第一行即块 #1
+  const firstRow = allLocalRows()[0];
+  assert.ok(firstRow.includes('x 0–239 · y 0–159'), '块 #1 坐标范围应为参考图像素: ' + firstRow);
+  // 位移前/后均差为两个独立单元格（第 6、7 列）：位移后均差应更低
+  const firstCells = firstRow.match(/<td[\s\S]*?<\/td>/g).map((s) => s.replace(/<[^>]*>/g, ''));
+  const meanBefore = Number(firstCells[5]), meanAfter = Number(firstCells[6]);
+  assert.ok(Number.isFinite(meanBefore) && Number.isFinite(meanAfter), '应展示位移前/后均差: ' + firstRow);
+  assert.ok(meanBefore > meanAfter, `位移后均差应更低: ${meanBefore} → ${meanAfter}`);
+  // 可比较点列：最佳候选可比较点/采样点数（240×160 块等距取 39×26 = 1014 点）
+  assert.ok(firstRow.includes('975/1014'), '应展示最佳候选可比较点/采样点数: ' + firstRow);
+  assert.ok(/合格候选 81/.test(firstRow), '不透明样例 81 个候选全部合格');
+  // 不含黑块的块位移前/后均差都为 0（取块 #16 最后一行，第 6、7 列为均差）
+  const row16Cells = allLocalRows()[15].match(/<td[\s\S]*?<\/td>/g).map((s) => s.replace(/<[^>]*>/g, ''));
+  assert.ok(allLocalRows()[15].includes('x 720–959 · y 480–639'), '块 #16 坐标范围: ' + allLocalRows()[15]);
+  assert.strictEqual(row16Cells[5], '0.00');
+  assert.strictEqual(row16Cells[6], '0.00');
+  // 统计：1 块检出局部偏移、0 块不可判定
+  assert.ok(els.localStats.textContent.includes('检出局部偏移 1 块'), '块 #1 应计入检出: ' + els.localStats.textContent);
+  assert.ok(els.localStats.textContent.includes('不可判定 0') ||
+    !els.localStats.textContent.includes('不可判定'), '无可判定块时不显示不可判定统计');
+  console.log('✓ 局部套色偏移：4×4 分块与 ±4 px 搜索，各块展示 dx/dy、方向与位移前后均差（含黑块检出 dy=+2）');
+
+  // 2.13 局部诊断与差异参数完全独立：色差阈值非法只清空差异视图，局部诊断保留
+  els.diffThreshold.value = '999';
+  fire(els.diffThreshold, 'input');
+  await flushDebounce();
+  assert.ok(els.diffHint.textContent.includes('色差阈值'), '差异视图应被清空: ' + els.diffHint.textContent);
+  assert.strictEqual(els.btnExportReview.disabled, true);
+  assert.strictEqual(els.localHint.textContent, '', '色差阈值非法不应影响局部诊断: ' + els.localHint.textContent);
+  assert.strictEqual(localRows(), 16, '局部诊断结果应保留');
+  assert.strictEqual(els.btnExportLocal.disabled, false);
+  els.diffThreshold.value = '32';
+  fire(els.diffThreshold, 'input');
+  await flushDebounce();
+  console.log('✓ 局部套色偏移：与色差阈值/最小面积参数独立，差异视图清空时诊断保留');
+
+  // 2.14 导出局部偏移 JSON
+  fire(els.btnExportLocal, 'click');
+  const lj = JSON.parse(await blobs[blobs.length - 1].text());
+  assert.strictEqual(lj.blockCount, 16);
+  assert.strictEqual(lj.decidableCount, 16);
+  assert.strictEqual(lj.shiftedCount, 1);
+  assert.strictEqual(lj.undecidableCount, 0);
+  assert.deepStrictEqual(lj.imageSize, { width: 960, height: 640 });
+  assert.deepStrictEqual(lj.grid, { cols: 4, rows: 4 });
+  assert.strictEqual(lj.maxSamplesPerBlock, 1024);
+  assert.strictEqual(lj.shiftRangePx, 4);
+  assert.strictEqual(lj.alphaMin, 128);
+  assert.strictEqual(lj.minComparableRatio, 0.2);
+  const b1 = lj.blocks[0];
+  assert.strictEqual(b1.index, 1);
+  assert.strictEqual(b1.row, 0);
+  assert.strictEqual(b1.col, 0);
+  assert.deepStrictEqual(b1.bounds, { x: 0, y: 0, width: 240, height: 160 });
+  assert.deepStrictEqual(b1.refCoordinateRange, { minX: 0, minY: 0, maxX: 239, maxY: 159 });
+  assert.strictEqual(b1.sampleCount, 1014);
+  assert.strictEqual(b1.decidable, true);
+  assert.strictEqual(b1.dx, 0);
+  assert.strictEqual(b1.dy, 2);
+  assert.strictEqual(b1.shiftLengthPx, 2);
+  assert.strictEqual(b1.direction, '↓');
+  assert.ok(b1.meanAbsoluteDiffBeforeShift > b1.meanAbsoluteDiffAfterShift,
+    '位移后均差应更低: ' + b1.meanAbsoluteDiffBeforeShift + ' → ' + b1.meanAbsoluteDiffAfterShift);
+  assert.ok(Math.abs(b1.meanAbsoluteDiffBeforeShift - 1.0726) < 1e-3);
+  assert.ok(Math.abs(b1.meanAbsoluteDiffAfterShift - 1.0462) < 1e-3);
+  assert.strictEqual(b1.comparablePointCount, 975);
+  assert.strictEqual(b1.eligibleCandidateCount, 81);
+  const b16 = lj.blocks[15];
+  assert.strictEqual(b16.dx, 0);
+  assert.strictEqual(b16.dy, 0);
+  assert.strictEqual(b16.direction, '●');
+  assert.strictEqual(b16.meanAbsoluteDiffBeforeShift, 0);
+  assert.strictEqual(b16.meanAbsoluteDiffAfterShift, 0);
+  assert.deepStrictEqual(b16.bounds, { x: 720, y: 480, width: 240, height: 160 });
+  assert.ok(typeof lj.exportedAt === 'string');
+  console.log('✓ 局部套色偏移：导出 local-shifts.json（坐标、位移、位移前后均差与采样信息齐全）');
+
   // 3. 导出矩阵 JSON，并验证其逆映射精度
   fire(els.btnExportMatrix, 'click');
   const mj = JSON.parse(await blobs[blobs.length - 1].text());
@@ -416,6 +524,10 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   await flushDebounce();
   assert.strictEqual(els.diffHint.textContent, '', '3 对精确点矩阵仍可导出: ' + els.diffHint.textContent);
   assert.ok(els.diffStats.textContent.includes('差异像素 100'), '点位变化后差异结果应更新: ' + els.diffStats.textContent);
+  // 局部诊断同样跟随矩阵重算并保持可用（3 对精确点）
+  assert.strictEqual(els.localHint.textContent, '', '3 对精确点局部诊断应可用: ' + els.localHint.textContent);
+  assert.strictEqual((els.localTable.querySelector('tbody').innerHTML.match(/<tr[\s>]/g) || []).length, 16);
+  assert.strictEqual(els.btnExportLocal.disabled, false);
   // 参与点不足 4 个：验证列全部「无法验证」，汇总不可用（不拿残差充数）
   assert.strictEqual((tbodyHtml().match(/无法验证/g) || []).length, 3);
   assert.ok(els.status.textContent.includes('留出验证：不可用（无可验证点）'));
@@ -450,6 +562,11 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(els.diffHint.textContent.includes('拟合无效'), '拟合无效时差异视图应说明原因: ' + els.diffHint.textContent);
   assert.strictEqual(els.diffTable.querySelector('tbody').innerHTML, '');
   assert.strictEqual(els.diffStats.textContent, '');
+  // 局部套色偏移诊断同样条件失效：清空旧诊断、禁用导出
+  assert.ok(els.localHint.textContent.includes('拟合无效'), '拟合无效时局部诊断应说明原因: ' + els.localHint.textContent);
+  assert.strictEqual(els.localTable.querySelector('tbody').innerHTML, '');
+  assert.strictEqual(els.localStats.textContent, '');
+  assert.strictEqual(els.btnExportLocal.disabled, true);
   console.log('✓ 共线控制点被拒绝并提示，导出按钮禁用（含校准扫描图的原因说明）');
 
   // 7. 透明度滑杆
@@ -561,6 +678,10 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   await flushDebounce();
   assert.ok(els.diffHint.textContent.includes('拟合无效'), '非法容差时差异视图应清空: ' + els.diffHint.textContent);
   assert.strictEqual(els.diffTable.querySelector('tbody').innerHTML, '');
+  // 局部诊断同样清空并禁用导出
+  assert.ok(els.localHint.textContent.includes('拟合无效'), '非法容差时局部诊断应清空: ' + els.localHint.textContent);
+  assert.strictEqual(els.localTable.querySelector('tbody').innerHTML, '');
+  assert.strictEqual(els.btnExportLocal.disabled, true);
   // 恢复合法容差
   els.tolerance.value = '2';
   fire(els.tolerance, 'input');

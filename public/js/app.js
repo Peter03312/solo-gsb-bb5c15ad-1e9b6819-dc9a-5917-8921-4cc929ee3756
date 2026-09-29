@@ -34,6 +34,16 @@
  *    交并比（IoU，Affine.matchDiffRegions）；仅当 IoU ≥ 0.5 且双方互为唯一重叠
  *    区域时才继承复核结论与备注，其余新区域一律显示「未复核」——绝不按排序编号
  *    沿用。更换任一图片（含载入示例）时清空全部控制点与复核记录。
+ *  - 「局部套色偏移」诊断：两图已加载且当前拟合矩阵通过导出校验（与差异视图、
+ *    校准扫描图导出同一条件）时，复用校准扫描图的同一份 RGBA 重采样结果
+ *    （Affine.transformRGBA），由 Affine.analyzeLocalShifts 把参考图均匀分成
+ *    4×4 块，每块等距取样至多 1024 个整数像素；在 dx、dy 各 ±4 px 的整数位移内
+ *    比较参考像素与位移后的校准像素，仅计双方 alpha ≥ 128 的 RGB 平均绝对差，
+ *    可比较点数不足该块采样点数 20% 的候选排除；取均差最小者，平局先取位移长度
+ *    较短者、再按 dx、dy 升序。界面按参考图坐标在各块上以箭头标出最佳位移方向，
+ *    并列出 dx、dy、位移前后均差；无合格候选的块显示「不可判定」。图像或矩阵
+ *    变化后去抖重算；条件失效时清空旧诊断并说明原因（与差异视图参数完全独立）；
+ *    结果可导出 local-shifts.json。全部像素处理在浏览器本地完成，图像不上传服务器。
  */
 (function () {
   'use strict';
@@ -60,7 +70,10 @@
     // 人工复核：reviews 为以区域编号（当前 diffResult 的 index）为键的映射
     diffReviews: {},         // { [index]: {verdict:'defect'|'acceptable', note, reviewedAt} }
     diffSelected: null,      // 当前选中的区域编号（diffResult 中的 index）
-    diffPrev: null           // 上次有效差异结果快照（{labels, width, height, reviews}），用于重算后 IoU 继承
+    diffPrev: null,          // 上次有效差异结果快照（{labels, width, height, reviews}），用于重算后 IoU 继承
+    // 局部套色偏移分块诊断
+    localTimer: null,        // 去抖句柄（拖动点位时合并重算）
+    localResult: null        // 最近一次 analyzeLocalShifts 结果（条件失效时为 null）
   };
 
   const HIT_RADIUS_CSS = 12;   // 命中半径（CSS 像素）
@@ -77,6 +90,11 @@
   const DIFF_MASK_ALPHA = 0.55;     // 差异掩码叠加不透明度
   const DIFF_MAX_TABLE_ROWS = 200;  // 区域表最多列出的行数
   const REVIEW_VERDICTS = { defect: '缺陷', acceptable: '可接受' };
+  const LOCAL_DEBOUNCE_MS = 80;     // 局部偏移诊断重算去抖（拖动时合并）
+  const COLOR_LOCAL_GRID = '#e2e8f0';   // 分块网格线
+  const COLOR_LOCAL_SHIFT = '#f59e0b';  // 检出局部偏移的块：橙箭头/文字
+  const COLOR_LOCAL_ZERO = '#94a3b8';   // 最佳位移为 0 的块：灰点
+  const COLOR_LOCAL_NA = '#94a3b8';     // 不可判定块：灰
 
   // ---------- DOM ----------
   const $ = (id) => document.getElementById(id);
@@ -112,6 +130,11 @@
   const btnVerdictDefect = $('btnVerdictDefect');
   const btnVerdictAccept = $('btnVerdictAccept');
   const btnReviewClear = $('btnReviewClear');
+  const localCanvas = $('localCanvas');
+  const localStatsEl = $('localStats');
+  const localHintEl = $('localHint');
+  const localTableBody = $('localTable').querySelector('tbody');
+  const btnExportLocal = $('btnExportLocal');
 
   // ---------- 图像加载 ----------
   function loadImageFromFile(file) {
@@ -179,6 +202,8 @@
     render();
     // 拟合矩阵可能变化（点位拖动/增删、模式、容差），差异结果跟随重算
     scheduleDiffUpdate();
+    // 局部套色偏移诊断同样复用重采样结果，跟随矩阵重算
+    scheduleLocalUpdate();
   }
 
   // ---------- 控制点操作 ----------
@@ -1136,6 +1161,265 @@
     });
   }
 
+  // ---------- 局部套色偏移分块诊断 ----------
+  // 前置条件与差异视图 / 校准扫描图导出一致：两图已加载、拟合有效且矩阵可导出
+  function localReadiness() {
+    return exportImageReadiness();
+  }
+
+  // 图像或矩阵可能变化时去抖重算（与差异视图各自独立去抖，但共用同一份重采样缓存）
+  function scheduleLocalUpdate() {
+    if (state.localTimer !== null) clearTimeout(state.localTimer);
+    state.localTimer = setTimeout(runLocalUpdate, LOCAL_DEBOUNCE_MS);
+  }
+
+  // 条件失效时清空旧诊断并说明原因（局部诊断不依赖色差阈值 / 最小面积参数）
+  function clearLocal(reason) {
+    if (state.localTimer !== null) {
+      clearTimeout(state.localTimer);
+      state.localTimer = null;
+    }
+    state.localResult = null;
+    localStatsEl.textContent = '';
+    localTableBody.innerHTML = '';
+    btnExportLocal.disabled = true;
+    localHintEl.textContent = reason ? '局部套色偏移诊断暂不可用：' + reason : '';
+    drawLocalView();
+  }
+
+  function runLocalUpdate() {
+    state.localTimer = null;
+    const ready = localReadiness();
+    if (!ready.ok) { // 缺图 / 拟合无效 / 矩阵不可导出：清空旧诊断并说明原因
+      clearLocal(ready.reason);
+      return;
+    }
+    try {
+      const w = state.refImg.naturalWidth;
+      const h = state.refImg.naturalHeight;
+      // 复用差异视图的同一份参考图像素与校准扫描图重采样结果（按两图 + 矩阵缓存）
+      const cache = ensureDiffCache(w, h);
+      state.localResult = Affine.analyzeLocalShifts(
+        cache.refData, cache.calibratedData, w, h
+      );
+      localHintEl.textContent = '';
+      drawLocalView();
+      renderLocalStats();
+      renderLocalTable();
+      btnExportLocal.disabled = false;
+    } catch (err) {
+      clearLocal(err.message || String(err));
+    }
+  }
+
+  function drawLocalPlaceholder(text) {
+    drawPlaceholder(localCanvas, text);
+  }
+
+  // 8 方向箭头：dx、dy 为块内最佳位移（屏幕坐标 y 向下，直接按分量绘制）
+  function arrowChar(dx, dy) {
+    if (dx === 0 && dy === 0) return '●';
+    if (dx === 0) return dy < 0 ? '↑' : '↓';
+    if (dy === 0) return dx < 0 ? '←' : '→';
+    if (dx < 0) return dy < 0 ? '↖' : '↙';
+    return dy < 0 ? '↗' : '↘';
+  }
+
+  function drawLocalView() {
+    const r = state.localResult;
+    if (!r) {
+      drawLocalPlaceholder('满足条件后此处显示 4×4 分块局部套色偏移');
+      return;
+    }
+    if (localCanvas.width !== r.width || localCanvas.height !== r.height) {
+      localCanvas.width = r.width;
+      localCanvas.height = r.height;
+    }
+    const ctx = localCanvas.getContext('2d');
+    const scale = canvasScale(localCanvas);
+    ctx.globalAlpha = 1;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    // 底图：参考图（坐标即参考图像素）
+    ctx.drawImage(state.refImg, 0, 0);
+
+    // 不可判定块整体压暗提示（0 尺寸空块跳过）；其余块仅描边
+    r.blocks.forEach((b) => {
+      if (!b.decidable && b.width > 0 && b.height > 0) {
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.55)';
+        ctx.fillRect(b.x, b.y, b.width, b.height);
+      }
+    });
+
+    // 4×4 分块网格（分区点与 analyzeLocalShifts 的 round 分块一致）
+    ctx.strokeStyle = COLOR_LOCAL_GRID;
+    ctx.lineWidth = 1.5 * scale;
+    ctx.beginPath();
+    for (let c = 0; c <= r.cols; c++) {
+      const gx = Math.round(c * r.width / r.cols) + 0.5;
+      ctx.moveTo(gx, 0); ctx.lineTo(gx, r.height);
+    }
+    for (let rr = 0; rr <= r.rows; rr++) {
+      const gy = Math.round(rr * r.height / r.rows) + 0.5;
+      ctx.moveTo(0, gy); ctx.lineTo(r.width, gy);
+    }
+    ctx.stroke();
+
+    // 各块标注：箭头方向 + dx,dy + 位移前→后均差
+    const fs = Math.max(10, 13 * scale);
+    r.blocks.forEach((b) => {
+      if (b.width === 0 || b.height === 0) return; // 空块不绘制标注
+      const cx = b.x + b.width / 2;
+      const cy = b.y + b.height / 2;
+      if (!b.decidable) {
+        ctx.font = `bold ${Math.max(fs, Math.min(b.width, b.height) * 0.18)}px system-ui, sans-serif`;
+        ctx.lineWidth = 3 * scale;
+        ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+        ctx.fillStyle = COLOR_LOCAL_NA;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.strokeText('不可判定', cx, cy);
+        ctx.fillText('不可判定', cx, cy);
+        return;
+      }
+      const shifted = b.dx !== 0 || b.dy !== 0;
+      const color = shifted ? COLOR_LOCAL_SHIFT : COLOR_LOCAL_ZERO;
+      // 箭头尺寸约为块短边的 30%，但限制在 14~34 CSS 像素，避免块过大时挤占文字
+      const arrowFs = Math.min(Math.max(14 * scale, Math.min(b.width, b.height) * 0.3), 34 * scale);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+      ctx.fillStyle = color;
+      ctx.lineWidth = 3 * scale;
+      ctx.font = `bold ${arrowFs}px system-ui, sans-serif`;
+      ctx.strokeText(arrowChar(b.dx, b.dy), cx, cy - b.height * 0.16);
+      ctx.fillText(arrowChar(b.dx, b.dy), cx, cy - b.height * 0.16);
+      ctx.font = `bold ${fs}px system-ui, sans-serif`;
+      const shiftText = shifted
+        ? `dx ${b.dx}, dy ${b.dy}`
+        : 'dx 0, dy 0（无偏移）';
+      ctx.strokeText(shiftText, cx, cy + b.height * 0.14);
+      ctx.fillText(shiftText, cx, cy + b.height * 0.14);
+      const meanText = `均差 ${fmt(b.meanBefore, 1)} → ${fmt(b.meanAfter, 1)}`;
+      ctx.font = `${fs * 0.9}px system-ui, sans-serif`;
+      ctx.strokeText(meanText, cx, cy + b.height * 0.3);
+      ctx.fillText(meanText, cx, cy + b.height * 0.3);
+    });
+
+    // 块序号（左上角小标；空块不标）
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.font = `bold ${fs}px system-ui, sans-serif`;
+    r.blocks.forEach((b) => {
+      if (b.width === 0 || b.height === 0) return;
+      ctx.lineWidth = 3 * scale;
+      ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+      ctx.fillStyle = b.decidable ? '#e2e8f0' : COLOR_LOCAL_NA;
+      ctx.strokeText('#' + b.index, b.x + 4 * scale, b.y + 3 * scale);
+      ctx.fillText('#' + b.index, b.x + 4 * scale, b.y + 3 * scale);
+    });
+  }
+
+  function renderLocalStats() {
+    const r = state.localResult;
+    if (!r) {
+      localStatsEl.textContent = '';
+      btnExportLocal.disabled = true;
+      return;
+    }
+    const decidable = r.blocks.filter((b) => b.decidable);
+    const shifted = decidable.filter((b) => b.dx !== 0 || b.dy !== 0);
+    const na = r.blocks.length - decidable.length;
+    localStatsEl.textContent =
+      `${r.cols}×${r.rows} 分块（共 ${r.blocks.length} 块）· 可判定 ${decidable.length} 块` +
+      ` · 检出局部偏移 ${shifted.length} 块` +
+      (na ? ` · 不可判定 ${na} 块` : '') +
+      ` · 位移搜索 ±${r.rangePx} px 整数位移 · 每块等距取样至多 ${r.maxSamplesPerBlock} 点` +
+      ` · 双方 alpha ≥ ${r.alphaMin} · 候选可比较点 ≥ ${Math.round(r.minComparableRatio * 100)}%`;
+  }
+
+  function renderLocalTable() {
+    const r = state.localResult;
+    if (!r) { localTableBody.innerHTML = ''; return; }
+    localTableBody.innerHTML = r.blocks.map((b) => {
+      const cls = !b.decidable
+        ? ' class="local-na-row"'
+        : (b.dx !== 0 || b.dy !== 0 ? ' class="local-shift-row"' : '');
+      const arrow = b.decidable ? arrowChar(b.dx, b.dy) : '—';
+      const range = `x ${b.x}–${b.x + b.width - 1} · y ${b.y}–${b.y + b.height - 1}`;
+      const dxdy = b.decidable
+        ? `${b.dx}, ${b.dy}`
+        : '不可判定';
+      const len = b.decidable ? fmt(b.shiftLength, 2) : '—';
+      const before = b.meanBefore === null ? '不可比较' : fmt(b.meanBefore, 2);
+      const after = b.decidable ? fmt(b.meanAfter, 2) : '—';
+      const cmp = b.decidable
+        ? `${b.comparableCount}/${b.sampleCount}（合格候选 ${b.eligibleCandidateCount}）`
+        : `${b.comparableBefore}/${b.sampleCount}（合格候选 0）`;
+      return `<tr${cls}>
+        <td>${b.index}</td>
+        <td>${range}</td>
+        <td class="local-arrow">${arrow}</td>
+        <td>${dxdy}</td>
+        <td>${len}</td>
+        <td>${before}</td>
+        <td>${after}</td>
+        <td>${cmp}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // 导出局部偏移诊断 JSON：逐块给出参考图坐标、最佳位移、位移前后均差与采样信息
+  function exportLocalJSON() {
+    const r = state.localResult;
+    if (!r) return;
+    let decidableCount = 0, shiftedCount = 0;
+    const blocks = r.blocks.map((b) => {
+      if (b.decidable) {
+        decidableCount++;
+        if (b.dx !== 0 || b.dy !== 0) shiftedCount++;
+      }
+      const round4 = (v) => (v === null ? null : Number(v.toFixed(4)));
+      return {
+        index: b.index,
+        row: b.row,
+        col: b.col,
+        bounds: { x: b.x, y: b.y, width: b.width, height: b.height },
+        refCoordinateRange: {
+          minX: b.x, minY: b.y,
+          maxX: b.x + b.width - 1, maxY: b.y + b.height - 1
+        },
+        sampleCount: b.sampleCount,
+        comparableBeforeShift: b.comparableBefore,
+        meanAbsoluteDiffBeforeShift: round4(b.meanBefore),
+        decidable: b.decidable,
+        dx: b.dx,
+        dy: b.dy,
+        shiftLengthPx: round4(b.shiftLength),
+        direction: b.decidable ? arrowChar(b.dx, b.dy) : null,
+        meanAbsoluteDiffAfterShift: round4(b.meanAfter),
+        comparablePointCount: b.comparableCount,
+        eligibleCandidateCount: b.eligibleCandidateCount
+      };
+    });
+    downloadJSON('local-shifts.json', {
+      description: '局部套色偏移分块诊断（参考图 4×4 分块；在 ±4 px 整数位移内比较参考像素与位移后的校准像素，' +
+        '仅计双方 alpha ≥ 128 的 RGB 平均绝对差，可比较点不足采样点数 20% 的候选排除；' +
+        'dx/dy 为校准像素相对参考像素的最佳位移，方向箭头按屏幕坐标（y 向下））',
+      imageSize: { width: r.width, height: r.height },
+      grid: { cols: r.cols, rows: r.rows },
+      maxSamplesPerBlock: r.maxSamplesPerBlock,
+      shiftRangePx: r.rangePx,
+      alphaMin: r.alphaMin,
+      minComparableRatio: r.minComparableRatio,
+      blockCount: r.blocks.length,
+      decidableCount,
+      shiftedCount,
+      undecidableCount: r.blocks.length - decidableCount,
+      blocks,
+      exportedAt: new Date().toISOString()
+    });
+  }
+
   // ---------- 示例图像 ----------
   function drawSampleContent(g, w, h) {
     g.fillStyle = '#f8fafc';
@@ -1227,6 +1511,8 @@
         render();
         // 拟合矩阵失效：差异条件同步失效，清空旧标记并说明原因
         scheduleDiffUpdate();
+        // 局部偏移诊断条件同样失效，清空旧诊断
+        scheduleLocalUpdate();
         return;
       }
       state.tolerancePx = v;
@@ -1260,6 +1546,9 @@
     reviewNoteInput.addEventListener('change', saveReviewNote);
     btnExportReview.addEventListener('click', exportReviewJSON);
 
+    // 局部套色偏移诊断：仅导出按钮交互（重算由图像/矩阵变化驱动，去抖执行）
+    btnExportLocal.addEventListener('click', exportLocalJSON);
+
     window.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && (state.pending.ref || state.pending.scan)) {
         state.pending = { ref: null, scan: null };
@@ -1272,6 +1561,8 @@
     render();
     // 差异视图初始为不可用状态（缺图），说明原因；之后由去抖更新驱动
     clearDiff(diffReadiness().reason);
+    // 局部偏移诊断初始同样为不可用状态（缺图）；之后由去抖更新驱动
+    clearLocal(localReadiness().reason);
   }
 
   init();
