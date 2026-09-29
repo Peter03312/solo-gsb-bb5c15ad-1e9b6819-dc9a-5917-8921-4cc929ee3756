@@ -179,6 +179,10 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(els.diffHint.textContent.includes('图像缺失'), '差异视图应说明图像缺失: ' + els.diffHint.textContent);
   assert.strictEqual(els.diffTable.querySelector('tbody').innerHTML, '');
   assert.strictEqual(els.btnExportReview.disabled, true, '无差异结果前导出复核按钮应禁用');
+  // 局部套色偏移诊断：初始缺图时同样清空并说明原因，表格为空、导出禁用
+  assert.ok(els.shiftHint.textContent.includes('图像缺失'), '局部诊断应说明图像缺失: ' + els.shiftHint.textContent);
+  assert.strictEqual(els.shiftTable.querySelector('tbody').innerHTML, '');
+  assert.strictEqual(els.btnExportShift.disabled, true, '无诊断结果前导出局部位移按钮应禁用');
   console.log('✓ 初始渲染正常，DOM id 与 index.html 一致（导出校准扫描图禁用并说明原因）');
 
   // 1. 载入示例图像
@@ -242,6 +246,55 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(els.diffTable.querySelector('tbody').innerHTML.includes('(40, 50, 10×10)'), '应展示边框: ' + els.diffTable.querySelector('tbody').innerHTML);
   assert.ok(els.diffTable.querySelector('tbody').innerHTML.includes('x 40–49 · y 50–59'), '应展示参考图坐标范围');
   console.log('✓ 差异区域：复用重采样结果逐像素比较，八邻域分组按面积展示边框/像素数/坐标范围');
+
+  // 2.6b 局部套色偏移诊断：复用同一重采样像素，参考图 4×4 分块、每块至多 1024 点
+  // （阈值/最小面积只影响差异视图，不影响局部诊断）
+  assert.strictEqual(els.shiftHint.textContent, '', '条件满足时局部诊断不应有禁用提示: ' + els.shiftHint.textContent);
+  const shiftTbodyEl = els.shiftTable.querySelector('tbody');
+  const shiftRows = () => (shiftTbodyEl.innerHTML.match(/<tr[\s>]/g) || []).length;
+  assert.strictEqual(shiftRows(), 16, '参考图应分成 4×4 = 16 块');
+  assert.ok(els.shiftStats.textContent.includes('4×4 块'), '统计应说明 4×4 分块: ' + els.shiftStats.textContent);
+  assert.ok(els.shiftStats.textContent.includes('至多 1024 点'));
+  assert.ok(els.shiftStats.textContent.includes('±4 px'));
+  assert.ok(els.shiftStats.textContent.includes('可判定 16 块'), '16 块全部不透明，均应可判定: ' + els.shiftStats.textContent);
+  assert.ok(els.shiftStats.textContent.includes('不可判定 0 块'));
+  assert.ok(shiftTbodyEl.innerHTML.includes('不可判定') === false, '不应有不可判定块');
+  // 块号、范围与采样数列按参考图坐标展示；绝大多数块内容一致 → (0,0) 无位移（绿点）
+  assert.ok(shiftTbodyEl.innerHTML.includes('(1, 1)'), '应按 (行,列) 列块号');
+  assert.ok(shiftTbodyEl.innerHTML.includes('0×160'), '应展示各块范围（参考图坐标）: ' + shiftTbodyEl.innerHTML);
+  assert.ok(shiftTbodyEl.innerHTML.includes('无位移'), '无局部位移的块应显示无位移');
+  // 含 10×10 黑块的块（行 2 列 1，参考坐标 y 0..159、x 0..239）对齐全白扫描图更优，
+  // 应报告非零位移（dx/dy 与箭头方向），且位移后均差小于位移前均差
+  const blackBlockRow = shiftTbodyEl.innerHTML.match(/<tr class="shift-moved">[\s\S]*?<\/tr>/);
+  assert.ok(blackBlockRow, '黑块所在块应标为有局部位移（shift-moved）: ' + shiftTbodyEl.innerHTML);
+  assert.ok(/<td>-?\d<\/td>\s*<td>-?\d<\/td>/.test(blackBlockRow[0]), '应展示整数 dx、dy 列');
+  const movedMeans = blackBlockRow[0].match(/([\d.]+)\s*→\s*<strong>([\d.]+)<\/strong>/);
+  assert.ok(movedMeans, '应展示位移前均差 → 位移后均差');
+  assert.ok(Number(movedMeans[2]) < Number(movedMeans[1]), '位移后均差应小于位移前均差');
+  // 导出局部位移 JSON
+  assert.strictEqual(els.btnExportShift.disabled, false);
+  const shiftBlobs = blobs.length;
+  fire(els.btnExportShift, 'click');
+  assert.strictEqual(blobs.length, shiftBlobs + 1, '应导出一个局部位移 JSON');
+  const sj = JSON.parse(await blobs[blobs.length - 1].text());
+  assert.strictEqual(sj.blockCount, 16);
+  assert.strictEqual(sj.decidableCount, 16);
+  assert.strictEqual(sj.undecidableCount, 0);
+  assert.strictEqual(sj.grid.rows, 4);
+  assert.strictEqual(sj.grid.columns, 4);
+  assert.strictEqual(sj.searchRangePx, 4);
+  assert.strictEqual(sj.maxSamplesPerBlock, 1024);
+  assert.strictEqual(sj.minComparableRatio, 0.2);
+  assert.strictEqual(sj.alphaMin, 128);
+  assert.deepStrictEqual(sj.imageSize, { width: 960, height: 640 });
+  assert.ok(sj.blocks.every((b) => b.row >= 1 && b.row <= 4 && b.col >= 1 && b.col <= 4));
+  assert.ok(sj.blocks.every((b) => b.decidable === true && Number.isFinite(b.dx) && Number.isFinite(b.dy)));
+  assert.ok(sj.blocks.every((b) => b.sampleCount <= 1024 && b.sampleCount > 0));
+  const movedBlock = sj.blocks.find((b) => b.dx !== 0 || b.dy !== 0);
+  assert.ok(movedBlock, '导出 JSON 应至少含一个非零位移块');
+  assert.ok(movedBlock.meanRgbAbsoluteDifferenceAfter < movedBlock.meanRgbAbsoluteDifferenceBefore);
+  assert.ok(typeof sj.exportedAt === 'string');
+  console.log('✓ 局部套色偏移诊断：4×4 分块、等距取样≤1024、±4px 搜索与 20% 门槛，表格展示 dx/dy/前后均差，JSON 可导出');
 
   // 2.7 色差阈值调大到 255 → 黑/白差值 255 不严格大于阈值，差异消失
   els.diffThreshold.value = '255';
@@ -450,6 +503,11 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(els.diffHint.textContent.includes('拟合无效'), '拟合无效时差异视图应说明原因: ' + els.diffHint.textContent);
   assert.strictEqual(els.diffTable.querySelector('tbody').innerHTML, '');
   assert.strictEqual(els.diffStats.textContent, '');
+  // 局部套色偏移诊断同样随条件失效清除旧结果
+  assert.ok(els.shiftHint.textContent.includes('拟合无效'), '拟合无效时局部诊断应说明原因: ' + els.shiftHint.textContent);
+  assert.strictEqual(els.shiftTable.querySelector('tbody').innerHTML, '');
+  assert.strictEqual(els.shiftStats.textContent, '');
+  assert.strictEqual(els.btnExportShift.disabled, true, '条件失效后局部位移导出应禁用');
   console.log('✓ 共线控制点被拒绝并提示，导出按钮禁用（含校准扫描图的原因说明）');
 
   // 7. 透明度滑杆
@@ -561,11 +619,17 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   await flushDebounce();
   assert.ok(els.diffHint.textContent.includes('拟合无效'), '非法容差时差异视图应清空: ' + els.diffHint.textContent);
   assert.strictEqual(els.diffTable.querySelector('tbody').innerHTML, '');
+  // 局部诊断同样随拟合失效清除，恢复后重算
+  assert.ok(els.shiftHint.textContent.includes('拟合无效'), '非法容差时局部诊断应清空: ' + els.shiftHint.textContent);
+  assert.strictEqual(els.shiftTable.querySelector('tbody').innerHTML, '');
   // 恢复合法容差
   els.tolerance.value = '2';
   fire(els.tolerance, 'input');
   assert.ok(els.status.textContent.includes('内点 5'));
   assert.strictEqual(els.btnExportImage.disabled, false, '容差恢复后导出校准扫描图应重新启用');
+  await flushDebounce();
+  assert.strictEqual(els.shiftTable.querySelector('tbody').innerHTML.match(/<tr[\s>]/g).length, 16,
+    '容差恢复（矩阵变化）后局部诊断应重算为 16 块');
   console.log('✓ 容差调整同步重算；非法容差提示并禁用导出（含校准扫描图）');
 
   // 13. 关闭稳健模式 → 回到经典最小二乘，全部点参与拟合

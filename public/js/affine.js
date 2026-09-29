@@ -44,6 +44,16 @@
  * （IoU = 交集像素 / 并集像素）；仅当 IoU ≥ REVIEW_MATCH_MIN_IOU（0.5）且
  * 双方互为唯一重叠区域（该老区域只与这一个新区域相交、反之亦然）时才配为
  * 同一区域。绝不按排序编号沿用。
+ *
+ * 局部套色偏移诊断（analyzeLocalShifts，可独立调用，纯像素计算）：整图仿射
+ * 校准后定位仍有局部套色偏移的位置。把参考图分成 gridY×gridX（默认 4×4）块，
+ * 每块在块内按等距步长取样至多 LOCAL_MAX_SAMPLES_PER_BLOCK（1024）个像素；
+ * 在水平、垂直各 ±LOCAL_MAX_SHIFT（4）像素的整数位移 (dx, dy) 内，比较参考
+ * 像素与位移后校准像素的 RGB 平均绝对差，仅双方 alpha 均 ≥ DIFF_ALPHA_MIN
+ * （128）且都落在图内的像素可比较。某位移候选的可比较点数不少于该块采样点
+ * 数的 LOCAL_MIN_COMPARABLE_RATIO（20%）才有效；有效候选中取均差最小者，
+ * 平局先取位移长度（√(dx²+dy²)）较短者，再按 dx 升序、dy 升序。无有效候选
+ * 的块标记为「不可判定」。
  */
 (function (root, factory) {
   const api = factory();
@@ -71,6 +81,15 @@
   const DEFAULT_DIFF_MIN_AREA = 20;
   // 人工复核继承：新老区域实际差异像素交并比（IoU）不低于该值才允许继承
   const REVIEW_MATCH_MIN_IOU = 0.5;
+  // 局部套色偏移诊断：块网格（gridY 行 × gridX 列，默认 4×4）
+  const LOCAL_SHIFT_GRID_X = 4;
+  const LOCAL_SHIFT_GRID_Y = 4;
+  // 局部诊断：每块等距取样的像素数上限
+  const LOCAL_MAX_SAMPLES_PER_BLOCK = 1024;
+  // 局部诊断：枚举位移的水平/垂直上限（像素，±LOCAL_MAX_SHIFT 的整数 dx/dy）
+  const LOCAL_MAX_SHIFT = 4;
+  // 局部诊断：候选位移可比较点数占该块采样点数的最小比例（20%）
+  const LOCAL_MIN_COMPARABLE_RATIO = 0.2;
 
   class FitError extends Error {
     constructor(code, message) {
@@ -811,6 +830,211 @@
     return { matches, newOverlapCounts, oldOverlapCounts };
   }
 
+  /**
+   * 局部套色偏移诊断（可独立调用，纯像素计算，不依赖 DOM/Canvas）。
+   *
+   * 整图仿射校准后定位仍有局部套色偏移的位置：把参考图（refData）分成
+   * gridY × gridX 个块（默认 4×4，坐标均为参考图像素），每块在块内按等距
+   * 步长取样至多 maxSamplesPerBlock（默认 1024）个像素；在水平、垂直各
+   * ±maxShiftPx（默认 4）像素的整数位移 (dx, dy) 内，比较参考像素与位移后
+   * 的校准像素（cmpData，通常由 transformRGBA 重采样得到，与参考图同尺寸）：
+   *   - 仅参考像素 (x, y) 与校准像素 (x+dx, y+dy) 双方 alpha 均 ≥
+   *     DIFF_ALPHA_MIN（128）、且位移后坐标仍在图内时，该采样点才可比较；
+   *   - 每对可比较像素的色差为 |ΔR|+|ΔG|+|ΔB| 的平均（RGB 平均绝对差）；
+   *   - 某候选位移的可比较点数 ≥ 该块采样点数 × minComparableRatio（默认 20%）
+   *     时才算有效候选；
+   *   - 在有效候选中取 RGB 平均绝对差最小者；平局先取位移长度
+   *     √(dx²+dy²) 较短者，再按 dx 升序、dy 升序；
+   *   - 无任何有效候选的块 decidable=false（不可判定）。
+   *
+     * 每块等距取样：取横纵相同的统一整数步长 s，从块左/上边缘起取
+   * x = x0 + i·s、y = y0 + j·s（均不越出块外），选满足采样点数
+   * (1+⌊(bw−1)/s⌋)·(1+⌊(bh−1)/s⌋) ≤ maxSamplesPerBlock 的最小步长，即块内
+   * 允许的最密等距网格；取不出任何采样点的空块（宽或高为 0）直接不可判定。
+   *
+   * @param {Uint8Array|Uint8ClampedArray} refData 参考图 RGBA 数据
+   * @param {Uint8Array|Uint8ClampedArray} cmpData 校准扫描图 RGBA 数据（同尺寸）
+   * @param {number} w 宽（正整数）
+   * @param {number} h 高（正整数）
+   * @param {{gridX?:number, gridY?:number, maxShiftPx?:number,
+   *          maxSamplesPerBlock?:number, minComparableRatio?:number}} [options]
+   * @returns {{width:number, height:number, gridX:number, gridY:number,
+   *            maxShiftPx:number, maxSamplesPerBlock:number, minComparableRatio:number,
+   *            blockCount:number, decidableCount:number, undecidableCount:number,
+   *            blocks:Array<{row:number, col:number, x:number, y:number,
+   *            width:number, height:number, sampleCount:number, decidable:boolean,
+   *            dx:number|null, dy:number|null, meanBefore:number|null,
+   *            meanAfter:number|null, comparableBefore:number, comparableCount:number,
+   *            candidateCount:number}>}}
+   *          块按行主序（row 升序、col 升序）排列；row/col 为 0 起序号，
+   *          x/y/width/height 为块在参考图中的像素范围（width=maxX−minX+1）。
+   *          meanBefore 为位移前 (0,0) 的 RGB 平均绝对差（该点对无可比较像素
+   *          时为 null）；不可判定块的 dx/dy/meanAfter 为 null。
+   * @throws {FitError} code = BAD_INPUT
+   */
+  function analyzeLocalShifts(refData, cmpData, w, h, options) {
+    if (!refData || !cmpData || !Number.isInteger(w) || !Number.isInteger(h) ||
+        w <= 0 || h <= 0 ||
+        refData.length !== w * h * 4 || cmpData.length !== w * h * 4) {
+      throw new FitError('BAD_INPUT', '局部偏移诊断的两张 RGBA 图像数据缺失或尺寸不一致');
+    }
+    const opts = options || {};
+    const gridX = opts.gridX === undefined ? LOCAL_SHIFT_GRID_X : opts.gridX;
+    const gridY = opts.gridY === undefined ? LOCAL_SHIFT_GRID_Y : opts.gridY;
+    const maxShiftPx = opts.maxShiftPx === undefined ? LOCAL_MAX_SHIFT : opts.maxShiftPx;
+    const maxSamples = opts.maxSamplesPerBlock === undefined
+      ? LOCAL_MAX_SAMPLES_PER_BLOCK
+      : opts.maxSamplesPerBlock;
+    const minRatio = opts.minComparableRatio === undefined
+      ? LOCAL_MIN_COMPARABLE_RATIO
+      : opts.minComparableRatio;
+    if (!Number.isInteger(gridX) || !Number.isInteger(gridY) || gridX <= 0 || gridY <= 0) {
+      throw new FitError('BAD_INPUT', '块网格行列数必须为正整数');
+    }
+    if (!Number.isInteger(maxShiftPx) || maxShiftPx < 0) {
+      throw new FitError('BAD_INPUT', '位移上限必须为不小于 0 的整数');
+    }
+    if (!Number.isInteger(maxSamples) || maxSamples <= 0) {
+      throw new FitError('BAD_INPUT', '每块取样点数上限必须为正整数');
+    }
+    if (!Number.isFinite(minRatio) || minRatio < 0 || minRatio > 1) {
+      throw new FitError('BAD_INPUT', '可比较点比例必须为 0~1 的数字');
+    }
+
+    const blocks = [];
+    let decidableCount = 0;
+
+    for (let row = 0; row < gridY; row++) {
+      // 行主序切块：前 rem 块多分得 1 个像素，保证块宽高之和恰为整图尺寸
+      const y0 = Math.floor(row * h / gridY);
+      const y1 = Math.floor((row + 1) * h / gridY); // 不含
+      for (let col = 0; col < gridX; col++) {
+        const x0 = Math.floor(col * w / gridX);
+        const x1 = Math.floor((col + 1) * w / gridX); // 不含
+        const bw = x1 - x0;
+        const bh = y1 - y0;
+
+        const baseResult = {
+          row, col, x: x0, y: y0, width: bw, height: bh,
+          sampleCount: 0, decidable: false,
+          dx: null, dy: null, meanBefore: null, meanAfter: null,
+          comparableBefore: 0, comparableCount: 0, candidateCount: 0
+        };
+
+        if (bw <= 0 || bh <= 0) { // 图小于网格数时可能出现空块
+          blocks.push(baseResult);
+          continue;
+        }
+
+        // 等距取样：取统一整数步长 s（横纵间距相同），从块左/上边缘起采样，
+        // 选满足采样点数 (1+⌊(bw−1)/s⌋)·(1+⌊(bh−1)/s⌋) ≤ maxSamples 的最小 s，
+        // 即块内允许的最密等距网格（总数至多 maxSamplesPerBlock）
+        let step = 1;
+        while ((1 + Math.floor((bw - 1) / step)) * (1 + Math.floor((bh - 1) / step)) > maxSamples) {
+          step++;
+        }
+        const nx = 1 + Math.floor((bw - 1) / step);
+        const ny = 1 + Math.floor((bh - 1) / step);
+        const sx = step, sy = step;
+
+        // 预生成块内采样坐标（位移枚举共用，保证每个候选比较同一组采样点）
+        const xs = new Int32Array(nx);
+        const ys = new Int32Array(ny);
+        for (let i = 0; i < nx; i++) xs[i] = x0 + i * sx;
+        for (let j = 0; j < ny; j++) ys[j] = y0 + j * sy;
+        const sampleCount = nx * ny;
+        const minComparable = minRatio * sampleCount;
+
+        let meanBefore = null;
+        let comparableBefore = 0;
+        let best = null; // { dx, dy, sum, comparable }
+        let candidateCount = 0;
+
+        for (let dy = -maxShiftPx; dy <= maxShiftPx; dy++) {
+          for (let dx = -maxShiftPx; dx <= maxShiftPx; dx++) {
+            let sum = 0, comparable = 0;
+            for (let j = 0; j < ny; j++) {
+              const yy = ys[j];
+              const cy = yy + dy;
+              if (cy < 0 || cy >= h) continue;
+              const rowRef = yy * w;
+              const rowCmp = cy * w;
+              for (let i = 0; i < nx; i++) {
+                const xx = xs[i];
+                const cx = xx + dx;
+                if (cx < 0 || cx >= w) continue;
+                const oRef = (rowRef + xx) * 4;
+                const oCmp = (rowCmp + cx) * 4;
+                // 仅双方 alpha 均 ≥ 128 的像素参与 RGB 平均绝对差
+                if (refData[oRef + 3] < DIFF_ALPHA_MIN ||
+                    cmpData[oCmp + 3] < DIFF_ALPHA_MIN) continue;
+                sum += Math.abs(refData[oRef] - cmpData[oCmp]) +
+                  Math.abs(refData[oRef + 1] - cmpData[oCmp + 1]) +
+                  Math.abs(refData[oRef + 2] - cmpData[oCmp + 2]);
+                comparable++;
+              }
+            }
+
+            if (dx === 0 && dy === 0) {
+              comparableBefore = comparable;
+              if (comparable > 0) meanBefore = sum / (comparable * 3);
+            }
+            // 有效候选：可比较点数不少于该块采样点数的 20%（加极小容差防浮点误判）
+            if (comparable + 1e-9 < minComparable) continue;
+            candidateCount++;
+            const cand = {
+              dx, dy,
+              sum, comparable,
+              mean: comparable > 0 ? sum / (comparable * 3) : 0
+            };
+            // 均差最小者胜；平局先比位移长度，再按 dx、dy 升序
+            if (!best ||
+                cand.mean < best.mean ||
+                (cand.mean === best.mean && (dx * dx + dy * dy) < (best.dx * best.dx + best.dy * best.dy)) ||
+                (cand.mean === best.mean && (dx * dx + dy * dy) === (best.dx * best.dx + best.dy * best.dy) &&
+                  (dx < best.dx || (dx === best.dx && dy < best.dy)))) {
+              best = cand;
+            }
+          }
+        }
+
+        if (best) {
+          decidableCount++;
+          blocks.push({
+            row, col, x: x0, y: y0, width: bw, height: bh,
+            sampleCount, decidable: true,
+            dx: best.dx, dy: best.dy,
+            meanBefore, meanAfter: best.mean,
+            comparableBefore, comparableCount: best.comparable, candidateCount
+          });
+        } else {
+          blocks.push({
+            ...baseResult,
+            sampleCount,
+            meanBefore,
+            comparableBefore,
+            candidateCount
+          });
+        }
+      }
+    }
+
+    const blockCount = gridX * gridY;
+    return {
+      width: w,
+      height: h,
+      gridX,
+      gridY,
+      maxShiftPx,
+      maxSamplesPerBlock: maxSamples,
+      minComparableRatio: minRatio,
+      blockCount,
+      decidableCount,
+      undecidableCount: blockCount - decidableCount,
+      blocks
+    };
+  }
+
   return {
     fitAffine,
     fitAffineRobust,
@@ -824,6 +1048,7 @@
     groupDiffRegions,
     findDifferenceRegions,
     matchDiffRegions,
+    analyzeLocalShifts,
     FitError,
     MIN_POINTS,
     COLLINEAR_RATIO,
@@ -834,6 +1059,11 @@
     DIFF_ALPHA_MIN,
     DEFAULT_DIFF_THRESHOLD,
     DEFAULT_DIFF_MIN_AREA,
-    REVIEW_MATCH_MIN_IOU
+    REVIEW_MATCH_MIN_IOU,
+    LOCAL_SHIFT_GRID_X,
+    LOCAL_SHIFT_GRID_Y,
+    LOCAL_MAX_SAMPLES_PER_BLOCK,
+    LOCAL_MAX_SHIFT,
+    LOCAL_MIN_COMPARABLE_RATIO
   };
 });

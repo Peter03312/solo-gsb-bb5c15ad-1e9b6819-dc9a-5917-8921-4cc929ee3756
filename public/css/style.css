@@ -194,7 +194,7 @@ button.del {
 #opacityVal { color: var(--muted); min-width: 42px; }
 
 /* 差异区域视图 */
-.diff-wrap { margin-top: 24px; }
+.diff-wrap, .shift-wrap { margin-top: 24px; }
 .diff-controls {
   display: flex;
   flex-wrap: wrap;
@@ -275,5 +275,12 @@ td.note-cell {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* 局部套色偏移诊断表 */
+.shift-wrap .diff-side table { font-size: 12px; }
+tr.shift-undecided td { color: var(--muted); }
+td.shift-na { font-style: italic; }
+tr.shift-zero td { color: #86efac; }
+tr.shift-moved td { color: #fcd34d; }
 
 footer { margin-top: 28px; color: var(--muted); font-size: 12px; }

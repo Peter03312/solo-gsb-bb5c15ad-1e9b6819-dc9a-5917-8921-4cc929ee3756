@@ -121,6 +121,32 @@
     </div>
   </section>
 
+  <section class="shift-wrap">
+    <h2>局部套色偏移诊断</h2>
+    <div class="diff-controls">
+      <span id="shiftStats" class="diff-stats"></span>
+      <button id="btnExportShift" type="button" disabled title="下载各 4×4 块的局部位移诊断结果 JSON（参考图坐标）">导出局部位移 JSON</button>
+      <span id="shiftHint" class="export-hint"></span>
+    </div>
+    <div class="diff-body">
+      <figure class="diff-view">
+        <figcaption>局部偏移视图 <span class="hint">参考图分成 4×4 块，块内等距取样至多 1024 点，在水平/垂直各 ±4 像素整数位移内比较 RGB 平均绝对差（仅双方 alpha ≥ 128）；箭头＝校准图相对参考图的局部位移方向，圆心点＝无位移，虚线灰框＝不可判定</span></figcaption>
+        <canvas id="shiftCanvas"></canvas>
+      </figure>
+      <div class="diff-side">
+        <table id="shiftTable">
+          <thead>
+            <tr>
+              <th>块 (行,列)</th><th>块范围 (x, y, w, h)</th><th>采样/可比较</th>
+              <th>方向</th><th>dx</th><th>dy</th><th>位移前均差 → 位移后均差</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
   <footer>
     <p>仿射最小二乘拟合在浏览器本地完成；图像不会上传服务器。POST /api/fit 提供同样的拟合接口供程序化调用。</p>
   </footer>

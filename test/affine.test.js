@@ -734,4 +734,213 @@ const setPx = (data, w, x, y, rgba) => {
   console.log('✓ 差异区域常量：ALPHA_MIN=128 / 默认阈值 32 / 默认最小面积 20 / 复核继承 IoU 阈值 0.5');
 }
 
+// ---------- 局部套色偏移诊断 analyzeLocalShifts ----------
+
+function solidRGBA(w, h, fn) {
+  const data = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const [r, g, b, a] = fn(x, y);
+      const o = (y * w + x) * 4;
+      data[o] = r; data[o + 1] = g; data[o + 2] = b; data[o + 3] = a;
+    }
+  }
+  return data;
+}
+// 确定性的不透明伪随机色块（各像素 RGB 由坐标哈希，避免大面积恒定导致位移不可分）
+function patternOpaque(w, h) {
+  return solidRGBA(w, h, (x, y) => {
+    const v = (x * 73856093 ^ y * 19349663) >>> 0;
+    return [v % 256, (v >>> 8) % 256, (v >>> 16) % 256, 255];
+  });
+}
+
+// 43. 完全相同的两图：所有块 (0,0) 最优、位移前后均差为 0
+{
+  const w = 32, h = 32;
+  const ref = patternOpaque(w, h);
+  const r = Affine.analyzeLocalShifts(ref, ref, w, h);
+  assert.strictEqual(r.blockCount, 16);
+  assert.strictEqual(r.decidableCount, 16);
+  assert.strictEqual(r.undecidableCount, 0);
+  assert.ok(r.blocks.every((b) => b.decidable && b.dx === 0 && b.dy === 0));
+  assert.ok(r.blocks.every((b) => b.meanBefore === 0 && b.meanAfter === 0));
+  assert.ok(r.blocks.every((b) => b.sampleCount > 0 && b.comparableCount === b.sampleCount));
+  assert.ok(r.blocks.every((b) => b.sampleCount <= Affine.LOCAL_MAX_SAMPLES_PER_BLOCK));
+  // 块按行主序、0 起行列号且铺满整图
+  assert.deepStrictEqual([r.blocks[0].row, r.blocks[0].col], [0, 0]);
+  assert.deepStrictEqual([r.blocks[15].row, r.blocks[15].col], [3, 3]);
+  assert.strictEqual(r.blocks[0].x, 0);
+  assert.strictEqual(r.blocks[15].x + r.blocks[15].width, w);
+  assert.strictEqual(r.blocks[15].y + r.blocks[15].height, h);
+  console.log('✓ analyzeLocalShifts：相同图像各块判定无位移（dx=dy=0，均差 0），4×4 块行主序铺满');
+}
+
+// 44. 校准图整体右移 2px：每块最优 dx=2，位移后均差降为 0、位移前均差显著
+{
+  const w = 64, h = 64;
+  const ref = patternOpaque(w, h);
+  // cmp(x, y) = ref(x−2, y)：ref(x) 与 cmp(x+2) = ref(x) 完全一致
+  const cmp = solidRGBA(w, h, (x, y) => {
+    if (x < 2) return [0, 0, 0, 0];
+    const o = (y * w + (x - 2)) * 4;
+    return [ref[o], ref[o + 1], ref[o + 2], 255];
+  });
+  const r = Affine.analyzeLocalShifts(ref, cmp, w, h);
+  assert.strictEqual(r.decidableCount, 16, '边缘两列越界只损失少量点，仍全部可判定');
+  for (const b of r.blocks) {
+    assert.strictEqual(b.dx, 2, `块 (${b.row},${b.col}) 最优 dx 应为 2`);
+    assert.strictEqual(b.dy, 0);
+    assert.ok(b.meanAfter < 1e-9, '对齐后均差应≈0: ' + b.meanAfter);
+    assert.ok(b.meanBefore > 20, '位移前均差应显著大于 0: ' + b.meanBefore);
+    assert.ok(b.meanBefore > b.meanAfter);
+    // 每块 16×16，步长 1 → 256 采样；最右列块右移后右两列越界，可比较 14×16=224，其余块仍 256
+    assert.strictEqual(b.sampleCount, 256);
+    assert.strictEqual(b.comparableCount, b.col === 3 ? 224 : 256);
+  }
+  console.log('✓ analyzeLocalShifts：整体右移 2px 被各块检出（dx=2，位移后均差≈0，边缘越界只损失可比较点）');
+}
+
+// 45. 校准图全部透明（或 alpha 127）：无像素满足双方 alpha ≥ 128 → 不可判定
+{
+  const w = 16, h = 16;
+  const ref = patternOpaque(w, h);
+  const transparent = new Uint8ClampedArray(w * h * 4); // alpha 全 0
+  let r = Affine.analyzeLocalShifts(ref, transparent, w, h, { gridX: 1, gridY: 1 });
+  assert.strictEqual(r.blockCount, 1);
+  assert.strictEqual(r.decidableCount, 0);
+  assert.strictEqual(r.undecidableCount, 1);
+  const b = r.blocks[0];
+  assert.strictEqual(b.decidable, false);
+  assert.strictEqual(b.dx, null);
+  assert.strictEqual(b.dy, null);
+  assert.strictEqual(b.meanAfter, null);
+  assert.strictEqual(b.meanBefore, null);
+  assert.strictEqual(b.comparableBefore, 0);
+  assert.strictEqual(b.candidateCount, 0, '无候选达到 20% 可比较点门槛');
+  // alpha = 127 同样不达标（门槛为 ≥ 128）
+  const a127 = solidRGBA(w, h, () => [200, 100, 50, 127]);
+  r = Affine.analyzeLocalShifts(ref, a127, w, h, { gridX: 1, gridY: 1 });
+  assert.strictEqual(r.blocks[0].decidable, false, 'alpha 127 的像素不得参与');
+  assert.strictEqual(r.blocks[0].candidateCount, 0);
+  console.log('✓ analyzeLocalShifts：双方 alpha 不足 128 时无合格候选，块标记不可判定');
+}
+
+// 46. 恒定色块：所有 81 个位移均差同为 0，平局先取位移长度最短 → (0,0)
+{
+  const w = 16, h = 16;
+  const ref = solidRGBA(w, h, () => [123, 45, 200, 255]);
+  const r = Affine.analyzeLocalShifts(ref, ref, w, h, { gridX: 1, gridY: 1 });
+  const b = r.blocks[0];
+  assert.strictEqual(b.decidable, true);
+  assert.strictEqual(b.dx, 0);
+  assert.strictEqual(b.dy, 0);
+  assert.strictEqual(b.candidateCount, 9 * 9, '±4 的全部 81 个位移均为有效候选');
+  assert.strictEqual(b.meanAfter, 0);
+  console.log('✓ analyzeLocalShifts：均差平局时先取位移长度最短（0,0）');
+}
+
+// 47. 水平条纹：dy=−1 与 dy=+1 等长且均差相同，再按 dy 升序选 −1（dx=0）
+{
+  const w = 8, h = 8;
+  // 偶数行黑、奇数行白（仅随 y 变化）；cmp(y) = ref(y−1)（校准图下移 1 行）
+  const ref = solidRGBA(w, h, (x, y) => (y % 2 === 0 ? [0, 0, 0, 255] : [255, 255, 255, 255]));
+  const cmp = solidRGBA(w, h, (x, y) => {
+    if (y < 1) return [0, 0, 0, 0];
+    const a = ref[(y - 1) * w * 4 + 3];
+    const v = (y - 1) % 2 === 0 ? 0 : 255;
+    return [v, v, v, a];
+  });
+  const r = Affine.analyzeLocalShifts(ref, cmp, w, h, { gridX: 1, gridY: 1 });
+  const b = r.blocks[0];
+  assert.strictEqual(b.dx, 0, '等长平局应保持 dx=0');
+  assert.strictEqual(b.dy, -1, 'dy +1/−1 等长且均差相同，应按 dy 升序取 −1');
+  assert.ok(b.meanAfter < 1e-9);
+  assert.ok(b.meanBefore > 100, '未对齐时条纹黑白相间，均差应很大');
+  console.log('✓ analyzeLocalShifts：位移长度相同的平局再按 dx、dy 升序（取 dy=−1）');
+}
+
+// 48. RGB 平均绝对差口径与 127 alpha 剔除
+{
+  const w = 4, h = 4;
+  const ref = solidRGBA(w, h, () => [100, 100, 100, 255]);
+  const cmp = solidRGBA(w, h, (x, y) => {
+    if (x === 0 && y === 0) return [200, 200, 200, 127]; // alpha 127：不参与
+    return [110, 110, 110, 255]; // 其余每通道差 10
+  });
+  const r = Affine.analyzeLocalShifts(ref, cmp, w, h, { gridX: 1, gridY: 1 });
+  const b = r.blocks[0];
+  assert.strictEqual(b.sampleCount, 16);
+  assert.strictEqual(b.comparableBefore, 15, '仅双方 alpha ≥ 128 的 15 个像素参与');
+  assert.ok(Math.abs(b.meanBefore - 10) < 1e-9, 'RGB 平均绝对差应为 10: ' + b.meanBefore);
+  assert.ok(Math.abs(b.meanAfter - 10) < 1e-9, '任意位移均差相同，平局取 (0,0)');
+  assert.strictEqual(b.dx, 0);
+  assert.strictEqual(b.dy, 0);
+  console.log('✓ analyzeLocalShifts：均差按 RGB 三通道平均绝对差，alpha 127 像素剔除但块仍可判定');
+}
+
+// 49. 可比较点不足 20%：把 8×8 块中绝大多数像素置为透明，仅留 1 列（1/8 = 12.5%）
+{
+  const w = 8, h = 8;
+  const ref = patternOpaque(w, h);
+  // 仅最左列不透明，且内容与 ref 一致；(0,0) 与所有位移的可比较点都 ≤ 1/8 < 20%
+  const cmp = solidRGBA(w, h, (x, y) => {
+    if (x !== 0) return [0, 0, 0, 0];
+    const o = (y * w + 0) * 4;
+    return [ref[o], ref[o + 1], ref[o + 2], 255];
+  });
+  const r = Affine.analyzeLocalShifts(ref, cmp, w, h, { gridX: 1, gridY: 1 });
+  assert.strictEqual(r.blocks[0].decidable, false, '可比较点 12.5% < 20%，应不可判定');
+  assert.strictEqual(r.blocks[0].candidateCount, 0);
+  // 但位移前均差仍以实际可比较对计算（1 列 8 个像素，均差 0）
+  assert.ok(Math.abs(r.blocks[0].meanBefore) < 1e-9);
+  assert.strictEqual(r.blocks[0].comparableBefore, 8);
+  console.log('✓ analyzeLocalShifts：可比较点不足采样点 20% 的块不可判定（位移前均差仍据实给出）');
+}
+
+// 50. 自定义选项：网格 2×2、取样上限 1；图窄于网格时空块不可判定
+{
+  const w = 4, h = 4;
+  const ref = patternOpaque(w, h);
+  const r = Affine.analyzeLocalShifts(ref, ref, w, h, { gridX: 2, gridY: 2 });
+  assert.strictEqual(r.blockCount, 4);
+  assert.strictEqual(r.gridX, 2);
+  assert.strictEqual(r.gridY, 2);
+  assert.ok(r.blocks.every((b) => b.sampleCount === 4 && b.width === 2 && b.height === 2));
+  // 8×8 单块、每块取样上限 1：步长需增大到只剩 1 个采样点
+  const r1 = Affine.analyzeLocalShifts(patternOpaque(8, 8), patternOpaque(8, 8), 8, 8,
+    { gridX: 1, gridY: 1, maxSamplesPerBlock: 1 });
+  assert.strictEqual(r1.blocks[0].sampleCount, 1);
+  // 图宽 2 切成 4 列：两列为空（宽 0），对应块不可判定，但 blockCount 仍为 16
+  const rThin = Affine.analyzeLocalShifts(patternOpaque(2, 32), patternOpaque(2, 32), 2, 32);
+  assert.strictEqual(rThin.blockCount, 16);
+  assert.strictEqual(rThin.undecidableCount, 8);
+  assert.strictEqual(rThin.decidableCount, 8);
+  assert.ok(rThin.blocks.filter((b) => b.width === 0).every((b) => !b.decidable && b.sampleCount === 0));
+  console.log('✓ analyzeLocalShifts：自定义网格/取样上限生效；图窄于网格的空块不可判定');
+}
+
+// 51. 非法参数拒绝
+{
+  const ref = patternOpaque(4, 4);
+  assert.throws(() => Affine.analyzeLocalShifts(ref, ref, 4, 3), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.analyzeLocalShifts(null, ref, 4, 4), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.analyzeLocalShifts(ref, ref, 4, 4, { gridX: 0 }), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.analyzeLocalShifts(ref, ref, 4, 4, { gridY: 1.5 }), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.analyzeLocalShifts(ref, ref, 4, 4, { maxShiftPx: -1 }), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.analyzeLocalShifts(ref, ref, 4, 4, { maxSamplesPerBlock: 0 }), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.analyzeLocalShifts(ref, ref, 4, 4, { minComparableRatio: 1.2 }), (e) => e.code === 'BAD_INPUT');
+  console.log('✓ analyzeLocalShifts：尺寸不符 / 网格 / 位移范围 / 取样上限 / 比例非法抛 BAD_INPUT');
+}
+
+// 52. 局部诊断常量默认值
+{
+  assert.strictEqual(Affine.LOCAL_SHIFT_GRID_X, 4);
+  assert.strictEqual(Affine.LOCAL_SHIFT_GRID_Y, 4);
+  assert.strictEqual(Affine.LOCAL_MAX_SAMPLES_PER_BLOCK, 1024);
+  assert.strictEqual(Affine.LOCAL_MAX_SHIFT, 4);
+  assert.strictEqual(Affine.LOCAL_MIN_COMPARABLE_RATIO, 0.2);
+  console.log('✓ 局部诊断常量：4×4 块 / 每块至多 1024 点 / ±4px / 可比较点门槛 20%');
+}
+
 console.log('\n全部测试通过 ✔');
